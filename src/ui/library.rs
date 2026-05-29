@@ -1,13 +1,13 @@
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Vec2};
 
 use crate::{
-    app::PlaymuApp,
+    app::{PlaymuApp, TrackAction},
     db::Track,
     icons::{icon_widget, Icon},
     models::{BrowseFocus, LibraryDensity, LibrarySortKey, LibraryView},
     theme::{
-        ACCENT_GREEN, ACCENT_GREEN_SOFT, PANEL_SOFT, SURFACE, TEXT_BRIGHT, TEXT_FAINT,
-        TEXT_MUTED, SURFACE_HOVER,
+        ACCENT_GREEN, ACCENT_GREEN_SOFT, PANEL_SOFT, SURFACE, SURFACE_HOVER, TEXT_BRIGHT,
+        TEXT_FAINT, TEXT_MUTED,
     },
     ui::{
         card_frame, paint_art_play,
@@ -344,7 +344,7 @@ impl PlaymuApp {
                                     .show(ui, |ui| {
                                         ui.set_min_height(52.0);
                                         ui.horizontal(|ui| {
-                                            let (_, clicked) = paint_art_play(ui, &track.album, 42.0, 8);
+                                            let (_, clicked) = paint_art_play(ui, &track.album, None, 42.0, 8);
                                             play_art = clicked;
                                             ui.add_space(10.0);
                                             ui.vertical(|ui| {
@@ -524,9 +524,11 @@ impl PlaymuApp {
         let title_color = if is_now_playing { ACCENT_GREEN } else { TEXT_BRIGHT };
         let show_art = self.library_density == LibraryDensity::Dense;
         let playlists_snap = self.playlists.clone();
+        let art_tex = self.get_art_texture(ui.ctx(), &track.artist, &track.album);
 
         let mut play_art_clicked = false;
         let mut playlist_chosen: Option<i64> = None;
+        let mut ctx_action: Option<TrackAction> = None;
 
         let response = egui::Frame::new()
             .fill(fill)
@@ -541,8 +543,13 @@ impl PlaymuApp {
                         |ui| {
                             if show_art {
                                 let art_size = row_height - 16.0;
-                                let (_, clicked) =
-                                    paint_art_play(ui, &track.album, art_size, 6);
+                                let (_, clicked) = paint_art_play(
+                                    ui,
+                                    &track.album,
+                                    art_tex.as_ref(),
+                                    art_size,
+                                    6,
+                                );
                                 play_art_clicked = clicked;
                                 ui.add_space(10.0);
                             }
@@ -584,24 +591,45 @@ impl PlaymuApp {
             .response
             .interact(Sense::click());
 
+        response.context_menu(|ui| {
+            if ui.button("Play Now").clicked() {
+                ctx_action = Some(TrackAction::PlayNow);
+                ui.close_menu();
+            }
+            if ui.button("Add to Queue End").clicked() {
+                ctx_action = Some(TrackAction::AddToQueueEnd);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Go to Album").clicked() {
+                ctx_action = Some(TrackAction::GoToAlbum);
+                ui.close_menu();
+            }
+            if ui.button("Go to Artist").clicked() {
+                ctx_action = Some(TrackAction::GoToArtist);
+                ui.close_menu();
+            }
+        });
+
         if response.hovered() {
             hover_highlight_row(ui, response.rect, 8);
         }
-
+        let track_id = track.id;
         if play_art_clicked {
-            self.selected_track_id = Some(track.id);
+            self.selected_track_id = Some(track_id);
             self.play_selected_from_visible();
         } else if response.double_clicked() {
-            self.selected_track_id = Some(track.id);
+            self.selected_track_id = Some(track_id);
             self.play_selected_from_visible();
         } else if response.clicked() {
-            self.selected_track_id = Some(track.id);
+            self.selected_track_id = Some(track_id);
         }
-
         if let Some(pl_id) = playlist_chosen {
-            self.add_track_to_playlist(pl_id, track.id);
+            self.add_track_to_playlist(pl_id, track_id);
         }
-
+        if let Some(action) = ctx_action {
+            self.handle_track_action(action, track_id);
+        }
         ui.add_space(gap);
     }
 }

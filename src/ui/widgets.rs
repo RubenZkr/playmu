@@ -108,7 +108,7 @@ pub fn draw_collection_card(
         .show(ui, |ui| {
             ui.set_min_size(egui::vec2(240.0, 92.0));
             ui.horizontal(|ui| {
-                paint_art(ui, title, 64.0, 10);
+                paint_art(ui, title, None, 64.0, 10);
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new(title).size(17.0).strong().color(TEXT_BRIGHT));

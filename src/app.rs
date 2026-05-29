@@ -854,11 +854,19 @@ impl PlaymuApp {
 
 impl eframe::App for PlaymuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.anim_time = ctx.input(|i| i.time);
         self.process_background_events();
 
         // Auto-advance when the current track ends.
         if self.audio_player.as_mut().is_some_and(AudioPlayer::take_finished) {
-            self.play_queue_offset(1);
+            if self.repeat == RepeatMode::Track {
+                // Re-play the same track.
+                if let Some(id) = self.queue_position.and_then(|p| self.queue.get(p)).copied() {
+                    self.play_track(id);
+                }
+            } else {
+                self.play_queue_offset(1);
+            }
         }
 
         // Live-repaint the progress bar while playing.
@@ -870,8 +878,11 @@ impl eframe::App for PlaymuApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
+        self.handle_global_shortcuts(ctx);
         self.draw_sidebar(ctx);
-        self.draw_right_panel(ctx);
+        if self.queue_panel_open {
+            self.draw_right_panel(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(12.0);
@@ -888,4 +899,12 @@ impl eframe::App for PlaymuApp {
 
         self.draw_bottom_bar(ctx);
     }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.save_session();
+    }
 }
+
+/// Internal helper: session persistence uses `image` for art decoding.
+#[allow(unused_imports)]
+use image as _image;
