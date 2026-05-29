@@ -11,6 +11,7 @@ pub struct Track {
     pub artist: String,
     pub album: String,
     pub duration_seconds: i64,
+    pub created_at: String,
 }
 
 pub fn init_database(db_path: &Path) -> Result<()> {
@@ -55,7 +56,7 @@ pub fn list_tracks(db_path: &Path) -> Result<Vec<Track>> {
     let connection = Connection::open(db_path)?;
     let mut statement = connection.prepare(
         "
-        SELECT id, file_path, title, artist, album, duration_seconds
+        SELECT id, file_path, title, artist, album, duration_seconds, created_at
         FROM tracks
         ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE, title COLLATE NOCASE
         ",
@@ -69,6 +70,7 @@ pub fn list_tracks(db_path: &Path) -> Result<Vec<Track>> {
             artist: row.get(3)?,
             album: row.get(4)?,
             duration_seconds: row.get(5)?,
+            created_at: row.get(6)?,
         })
     })?;
 
