@@ -1,0 +1,12 @@
+[package]
+name = "playmu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+eframe = "0.33"
+egui = "0.33"
+rodio = "0.17.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+walkdir = "2.5"
