@@ -1,6 +1,12 @@
 mod app;
+mod audio;
 mod db;
+mod icons;
 mod library;
+mod models;
+mod theme;
+mod ui;
+mod util;
 
 use anyhow::Result;
 use eframe::egui;
@@ -19,5 +25,5 @@ fn main() -> Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(app::PlaymuApp::new(cc)))),
     )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    .map_err(|e| anyhow::anyhow!(e.to_string()))
 }

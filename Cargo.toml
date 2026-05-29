@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1.0"
 eframe = "0.33"
 egui = "0.33"
+image = "0.25.10"
+lofty = "0.24.0"
 rodio = "0.17.3"
 rusqlite = { version = "0.37", features = ["bundled"] }
 walkdir = "2.5"

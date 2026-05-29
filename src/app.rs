@@ -1,76 +1,72 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    io::BufReader,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
+    time::Duration,
 };
 
-use eframe::egui::{self, Color32, RichText, TextEdit};
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use eframe::egui;
 
 use crate::{
-    db::{self, Track},
+    audio::AudioPlayer,
+    db::{self, Playlist, Track},
     library::{self, ScanSummary},
+    models::{
+        AlbumSummary, ArtistSummary, BrowseFocus, LibraryDensity, LibrarySortKey, LibraryStats,
+        LibraryView, MixSummary, NavSection, PlaylistView, RepeatMode, SearchResults,
+    },
+    theme::configure_theme,
+    util::{summarize_albums, summarize_artists},
 };
 
-const ACCENT_GREEN: Color32 = Color32::from_rgb(29, 185, 84);
-const ACCENT_GREEN_SOFT: Color32 = Color32::from_rgb(37, 102, 62);
-const PANEL_DARK: Color32 = Color32::from_rgb(15, 18, 18);
-const PANEL_SOFT: Color32 = Color32::from_rgb(24, 28, 29);
-const SURFACE: Color32 = Color32::from_rgb(31, 36, 38);
-const SURFACE_HOVER: Color32 = Color32::from_rgb(39, 46, 48);
-const TEXT_MUTED: Color32 = Color32::from_rgb(155, 163, 166);
-
+/// Actions that can be triggered from a track's context menu.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum NavSection {
-    Home,
-    Search,
-    Library,
-}
-
-impl NavSection {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Home => "Home",
-            Self::Search => "Search",
-            Self::Library => "Your Library",
-        }
-    }
-
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::Home => "A focused landing space for your own collection.",
-            Self::Search => "Jump to any song, artist, or album in your local library.",
-            Self::Library => "Dense browsing for tracks, artists, and albums.",
-        }
-    }
-}
-
-#[derive(Clone)]
-struct LibraryStats {
-    track_count: usize,
-    artist_count: usize,
-    album_count: usize,
-    top_artists: Vec<(String, usize)>,
-    recent_tracks: Vec<Track>,
+pub enum TrackAction {
+    PlayNow,
+    AddToQueueEnd,
+    GoToAlbum,
+    GoToArtist,
 }
 
 pub struct PlaymuApp {
-    db_path: PathBuf,
-    source_input: String,
-    search_query: String,
-    tracks: Vec<Track>,
-    selected_track_id: Option<i64>,
-    now_playing_track_id: Option<i64>,
-    queue: Vec<i64>,
-    queue_position: Option<usize>,
-    active_nav: NavSection,
-    status: String,
-    scan_receiver: Option<Receiver<Result<ScanSummary, String>>>,
-    is_scanning: bool,
-    audio_player: Option<AudioPlayer>,
+    pub(crate) db_path: PathBuf,
+    pub(crate) source_input: String,
+    pub(crate) search_query: String,
+    pub(crate) tracks: Vec<Track>,
+    pub(crate) selected_track_id: Option<i64>,
+    pub(crate) now_playing_track_id: Option<i64>,
+    pub(crate) queue: Vec<i64>,
+    pub(crate) queue_position: Option<usize>,
+    pub(crate) active_nav: NavSection,
+    pub(crate) library_view: LibraryView,
+    pub(crate) browse_focus: BrowseFocus,
+    pub(crate) library_sort_key: LibrarySortKey,
+    pub(crate) library_sort_ascending: bool,
+    pub(crate) library_density: LibraryDensity,
+    pub(crate) recently_played: Vec<Track>,
+    pub(crate) pinned_albums: Vec<(String, String)>,
+    pub(crate) search_input_has_focus: bool,
+    pub(crate) status: String,
+    pub(crate) scan_receiver: Option<Receiver<Result<ScanSummary, String>>>,
+    pub(crate) is_scanning: bool,
+    pub(crate) audio_player: Option<AudioPlayer>,
+    // Playlists
+    pub(crate) playlists: Vec<Playlist>,
+    pub(crate) active_playlist_id: Option<i64>,
+    pub(crate) new_playlist_name: String,
+    pub(crate) show_create_playlist: bool,
+    /// Track whose "add to playlist" popup is open (None = closed).
+    pub(crate) add_to_playlist_track_id: Option<i64>,
+    // Playback modes
+    pub(crate) shuffle: bool,
+    pub(crate) repeat: RepeatMode,
+    // Layout
+    pub(crate) queue_panel_open: bool,
+    // Album art texture cache: "artist\x00album" → TextureHandle
+    pub(crate) art_cache: HashMap<String, egui::TextureHandle>,
+    // Current time for animations (seconds since startup)
+    pub(crate) anim_time: f64,
 }
 
 impl PlaymuApp {
@@ -81,22 +77,23 @@ impl PlaymuApp {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("playmu.db");
 
-        let mut status = String::from("Add a music folder path, import it, then select a track to play.");
+        let mut status =
+            String::from("Add a music folder path, import it, then select a track to play.");
 
-        if let Err(error) = db::init_database(&db_path) {
-            status = format!("Database initialization failed: {error}");
+        if let Err(e) = db::init_database(&db_path) {
+            status = format!("Database initialization failed: {e}");
         }
 
         let tracks = db::list_tracks(&db_path).unwrap_or_default();
         let audio_player = match AudioPlayer::new() {
             Ok(player) => Some(player),
-            Err(error) => {
-                status = format!("Audio output unavailable: {error}");
+            Err(e) => {
+                status = format!("Audio output unavailable: {e}");
                 None
             }
         };
 
-        Self {
+        let mut app = Self {
             db_path,
             source_input: String::new(),
             search_query: String::new(),
@@ -106,20 +103,45 @@ impl PlaymuApp {
             queue: Vec::new(),
             queue_position: None,
             active_nav: NavSection::Home,
+            library_view: LibraryView::Songs,
+            browse_focus: BrowseFocus::All,
+            library_sort_key: LibrarySortKey::Artist,
+            library_sort_ascending: true,
+            library_density: LibraryDensity::Dense,
+            recently_played: Vec::new(),
+            pinned_albums: Vec::new(),
+            search_input_has_focus: false,
             status,
             scan_receiver: None,
             is_scanning: false,
             audio_player,
-        }
+            playlists: Vec::new(),
+            active_playlist_id: None,
+            new_playlist_name: String::new(),
+            show_create_playlist: false,
+            add_to_playlist_track_id: None,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            queue_panel_open: true,
+            art_cache: HashMap::new(),
+            anim_time: 0.0,
+        };
+        app.refresh_home_personalization();
+        app.refresh_playlists();
+        app.restore_session();
+        app
     }
 
-    fn start_scan(&mut self) {
+    // -------------------------------------------------------------------------
+    // Scan / import
+    // -------------------------------------------------------------------------
+
+    pub fn start_scan(&mut self) {
         let source_folder = self.source_input.trim();
         if source_folder.is_empty() {
             self.status = "Enter an absolute music-folder path before importing.".to_string();
             return;
         }
-
         let source_path = PathBuf::from(source_folder);
         if !source_path.exists() || !source_path.is_dir() {
             self.status = "The path does not exist or is not a directory.".to_string();
@@ -134,15 +156,16 @@ impl PlaymuApp {
 
         thread::spawn(move || {
             let result = library::scan_music_folder(&db_path, &source_path)
-                .map_err(|error| error.to_string());
+                .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
     }
 
     fn refresh_after_scan(&mut self, summary: ScanSummary) {
         self.tracks = db::list_tracks(&self.db_path).unwrap_or_default();
+        self.refresh_home_personalization();
         if self.selected_track_id.is_none() {
-            self.selected_track_id = self.tracks.first().map(|track| track.id);
+            self.selected_track_id = self.tracks.first().map(|t| t.id);
         }
         self.status = format!(
             "Imported {} tracks from {}. Removed {} stale entries.",
@@ -151,17 +174,17 @@ impl PlaymuApp {
         self.is_scanning = false;
     }
 
-    fn process_background_events(&mut self) {
+    pub fn process_background_events(&mut self) {
         if let Some(receiver) = &self.scan_receiver {
             match receiver.try_recv() {
                 Ok(Ok(summary)) => {
                     self.scan_receiver = None;
                     self.refresh_after_scan(summary);
                 }
-                Ok(Err(error)) => {
+                Ok(Err(e)) => {
                     self.scan_receiver = None;
                     self.is_scanning = false;
-                    self.status = format!("Scan failed: {error}");
+                    self.status = format!("Scan failed: {e}");
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -173,25 +196,37 @@ impl PlaymuApp {
         }
     }
 
-    fn selected_track(&self) -> Option<&Track> {
-        let selected_id = self.selected_track_id?;
-        self.tracks.iter().find(|track| track.id == selected_id)
+    // -------------------------------------------------------------------------
+    // Track queries
+    // -------------------------------------------------------------------------
+
+    pub fn selected_track(&self) -> Option<&Track> {
+        self.tracks.iter().find(|t| Some(t.id) == self.selected_track_id)
     }
 
-    fn current_track(&self) -> Option<&Track> {
-        let current_id = self.now_playing_track_id?;
-        self.tracks.iter().find(|track| track.id == current_id)
+    pub fn current_track(&self) -> Option<&Track> {
+        self.tracks.iter().find(|t| Some(t.id) == self.now_playing_track_id)
     }
 
-    fn visible_tracks(&self) -> Vec<&Track> {
+    pub fn filtered_tracks(&self) -> Vec<&Track> {
         let query = self.search_query.trim().to_ascii_lowercase();
-        if query.is_empty() {
-            return self.tracks.iter().collect();
-        }
-
         self.tracks
             .iter()
             .filter(|track| {
+                let focus_ok = match &self.browse_focus {
+                    BrowseFocus::All => true,
+                    BrowseFocus::Artist(a) => track.artist.eq_ignore_ascii_case(a),
+                    BrowseFocus::Album { artist, album } => {
+                        track.artist.eq_ignore_ascii_case(artist)
+                            && track.album.eq_ignore_ascii_case(album)
+                    }
+                };
+                if !focus_ok {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
                 let haystack = format!(
                     "{} {} {}",
                     track.title.to_ascii_lowercase(),
@@ -203,17 +238,62 @@ impl PlaymuApp {
             .collect()
     }
 
-    fn library_stats(&self) -> LibraryStats {
+    pub fn sorted_library_tracks(&self) -> Vec<Track> {
+        let mut tracks: Vec<Track> = self.filtered_tracks().into_iter().cloned().collect();
+        tracks.sort_by(|a, b| {
+            let ord = match self.library_sort_key {
+                LibrarySortKey::Title => a.title.cmp(&b.title),
+                LibrarySortKey::Artist => a.artist.cmp(&b.artist),
+                LibrarySortKey::Album => a.album.cmp(&b.album),
+                LibrarySortKey::Duration => a.duration_seconds.cmp(&b.duration_seconds),
+            };
+            let tiebreak = ord
+                .then_with(|| a.artist.cmp(&b.artist))
+                .then_with(|| a.album.cmp(&b.album))
+                .then_with(|| a.title.cmp(&b.title));
+            if self.library_sort_ascending { tiebreak } else { tiebreak.reverse() }
+        });
+        tracks
+    }
+
+    pub fn library_albums(&self) -> Vec<AlbumSummary> {
+        summarize_albums(self.filtered_tracks())
+    }
+
+    pub fn library_artists(&self) -> Vec<ArtistSummary> {
+        summarize_artists(self.filtered_tracks())
+    }
+
+    pub fn queue_tracks(&self) -> Vec<&Track> {
+        self.queue
+            .iter()
+            .filter_map(|id| self.tracks.iter().find(|t| t.id == *id))
+            .collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // Home personalisation
+    // -------------------------------------------------------------------------
+
+    pub fn refresh_home_personalization(&mut self) {
+        self.recently_played =
+            db::list_recently_played_tracks(&self.db_path, 12).unwrap_or_default();
+        self.pinned_albums = db::list_pinned_albums(&self.db_path).unwrap_or_default();
+    }
+
+    pub fn library_stats(&self) -> LibraryStats {
         let artist_count = self
             .tracks
             .iter()
-            .map(|track| track.artist.to_ascii_lowercase())
+            .map(|t| t.artist.to_ascii_lowercase())
             .collect::<HashSet<_>>()
             .len();
         let album_count = self
             .tracks
             .iter()
-            .map(|track| format!("{}::{}", track.artist.to_ascii_lowercase(), track.album.to_ascii_lowercase()))
+            .map(|t| {
+                format!("{}::{}", t.artist.to_ascii_lowercase(), t.album.to_ascii_lowercase())
+            })
             .collect::<HashSet<_>>()
             .len();
 
@@ -221,90 +301,524 @@ impl PlaymuApp {
         for track in &self.tracks {
             *artist_totals.entry(track.artist.clone()).or_default() += 1;
         }
-
         let mut top_artists: Vec<(String, usize)> = artist_totals.into_iter().collect();
-        top_artists.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        top_artists.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         top_artists.truncate(5);
 
         let mut recent_tracks = self.tracks.clone();
-        recent_tracks.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        recent_tracks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         recent_tracks.truncate(8);
+
+        let recent_albums = summarize_albums(recent_tracks.iter())
+            .into_iter()
+            .take(6)
+            .collect();
 
         LibraryStats {
             track_count: self.tracks.len(),
             artist_count,
             album_count,
             top_artists,
-            recent_tracks,
+            recent_albums,
         }
     }
 
-    fn play_selected_from_visible(&mut self) {
+    pub fn search_results(&self) -> SearchResults {
+        let tracks: Vec<Track> = self.filtered_tracks().into_iter().cloned().collect();
+        SearchResults::from_tracks(tracks)
+    }
+
+    pub fn selected_album_key(&self) -> Option<(String, String)> {
+        self.selected_track()
+            .map(|t| (t.artist.clone(), t.album.clone()))
+    }
+
+    pub fn is_album_pinned(&self, artist: &str, album: &str) -> bool {
+        self.pinned_albums
+            .iter()
+            .any(|(a, b)| a.eq_ignore_ascii_case(artist) && b.eq_ignore_ascii_case(album))
+    }
+
+    pub fn toggle_selected_album_pin(&mut self) {
+        let Some((artist, album)) = self.selected_album_key() else {
+            self.status = "Select a track first to pin or unpin its album.".to_string();
+            return;
+        };
+        let should_pin = !self.is_album_pinned(&artist, &album);
+        match db::set_album_pinned(&self.db_path, &artist, &album, should_pin) {
+            Ok(()) => {
+                self.refresh_home_personalization();
+                self.status = if should_pin {
+                    format!("Pinned album: {artist} - {album}")
+                } else {
+                    format!("Unpinned album: {artist} - {album}")
+                };
+            }
+            Err(e) => self.status = format!("Unable to update pin state: {e}"),
+        }
+    }
+
+    pub fn pinned_album_summaries(&self) -> Vec<AlbumSummary> {
+        let all_albums = summarize_albums(self.tracks.iter());
+        self.pinned_albums
+            .iter()
+            .filter_map(|(artist, album)| {
+                all_albums.iter().find(|c| {
+                    c.artist.eq_ignore_ascii_case(artist) && c.title.eq_ignore_ascii_case(album)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn generated_mixes(&self) -> Vec<MixSummary> {
+        let mut mixes = Vec::new();
+        if self.recently_played.is_empty() {
+            return mixes;
+        }
+
+        let mut seen = HashSet::new();
+        let replay_ids: Vec<i64> = self
+            .recently_played
+            .iter()
+            .filter(|t| seen.insert(t.id))
+            .map(|t| t.id)
+            .collect();
+        if !replay_ids.is_empty() {
+            mixes.push(MixSummary {
+                name: "Replay Mix".to_string(),
+                description: "Your most recently played songs.".to_string(),
+                track_ids: replay_ids,
+            });
+        }
+
+        let mut artist_scores: HashMap<String, usize> = HashMap::new();
+        for track in &self.recently_played {
+            *artist_scores.entry(track.artist.clone()).or_default() += 1;
+        }
+        if let Some((artist_name, _)) = artist_scores.into_iter().max_by_key(|(_, c)| *c) {
+            let ids: Vec<i64> = self
+                .tracks
+                .iter()
+                .filter(|t| t.artist.eq_ignore_ascii_case(&artist_name))
+                .take(30)
+                .map(|t| t.id)
+                .collect();
+            if !ids.is_empty() {
+                mixes.push(MixSummary {
+                    name: format!("{artist_name} Mix"),
+                    description: "Generated from your top local-history artist.".to_string(),
+                    track_ids: ids,
+                });
+            }
+        }
+
+        let album_keys: HashSet<(String, String)> = self
+            .recently_played
+            .iter()
+            .map(|t| (t.artist.clone(), t.album.clone()))
+            .collect();
+        let mut bounce_ids = Vec::new();
+        let mut bounce_seen = HashSet::new();
+        for track in &self.tracks {
+            if album_keys
+                .iter()
+                .any(|(a, b)| track.artist.eq_ignore_ascii_case(a) && track.album.eq_ignore_ascii_case(b))
+                && bounce_seen.insert(track.id)
+            {
+                bounce_ids.push(track.id);
+            }
+            if bounce_ids.len() >= 40 {
+                break;
+            }
+        }
+        if !bounce_ids.is_empty() {
+            mixes.push(MixSummary {
+                name: "Album Bounce".to_string(),
+                description: "Songs from albums you recently touched.".to_string(),
+                track_ids: bounce_ids,
+            });
+        }
+
+        mixes
+    }
+
+    // -------------------------------------------------------------------------
+    // Session persistence
+    // -------------------------------------------------------------------------
+
+    pub fn save_session(&self) {
+        let volume = self
+            .audio_player
+            .as_ref()
+            .map(|p| p.volume())
+            .unwrap_or(1.0);
+        let _ = db::set_setting(&self.db_path, "volume", &volume.to_string());
+        let _ = db::set_setting(
+            &self.db_path,
+            "shuffle",
+            if self.shuffle { "1" } else { "0" },
+        );
+        let repeat_str = match self.repeat {
+            RepeatMode::Off => "off",
+            RepeatMode::Queue => "queue",
+            RepeatMode::Track => "track",
+        };
+        let _ = db::set_setting(&self.db_path, "repeat", repeat_str);
+        let nav_str = match self.active_nav {
+            NavSection::Home => "home",
+            NavSection::Search => "search",
+            NavSection::Library => "library",
+        };
+        let _ = db::set_setting(&self.db_path, "active_nav", nav_str);
+        if let Some(id) = self.now_playing_track_id {
+            let _ = db::set_setting(&self.db_path, "last_track_id", &id.to_string());
+        }
+    }
+
+    fn restore_session(&mut self) {
+        if let Ok(Some(vol)) = db::get_setting(&self.db_path, "volume") {
+            if let Ok(v) = vol.parse::<f32>() {
+                if let Some(player) = self.audio_player.as_mut() {
+                    player.set_volume(v);
+                }
+            }
+        }
+        if let Ok(Some(s)) = db::get_setting(&self.db_path, "shuffle") {
+            self.shuffle = s == "1";
+        }
+        if let Ok(Some(r)) = db::get_setting(&self.db_path, "repeat") {
+            self.repeat = match r.as_str() {
+                "queue" => RepeatMode::Queue,
+                "track" => RepeatMode::Track,
+                _ => RepeatMode::Off,
+            };
+        }
+        if let Ok(Some(nav)) = db::get_setting(&self.db_path, "active_nav") {
+            self.active_nav = match nav.as_str() {
+                "search" => NavSection::Search,
+                "library" => NavSection::Library,
+                _ => NavSection::Home,
+            };
+        }
+        if let Ok(Some(id_str)) = db::get_setting(&self.db_path, "last_track_id") {
+            if let Ok(id) = id_str.parse::<i64>() {
+                if self.tracks.iter().any(|t| t.id == id) {
+                    self.selected_track_id = Some(id);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Album art (lazy texture loading)
+    // -------------------------------------------------------------------------
+
+    /// Returns a reference to a loaded texture, loading from DB + decoding on first access.
+    pub fn get_art_texture(
+        &mut self,
+        ctx: &egui::Context,
+        artist: &str,
+        album: &str,
+    ) -> Option<egui::TextureHandle> {
+        let key = format!("{artist}\x00{album}");
+        if self.art_cache.contains_key(&key) {
+            return self.art_cache.get(&key).cloned();
+        }
+        // Not cached — try loading from the database.
+        let bytes = db::get_album_art(&self.db_path, artist, album).ok().flatten()?;
+        let img = image::load_from_memory(&bytes).ok()?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let pixels: Vec<egui::Color32> = rgba
+            .pixels()
+            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+            .collect();
+        let color_image = egui::ColorImage { size: [w as usize, h as usize], pixels };
+        let handle = ctx.load_texture(&key, color_image, egui::TextureOptions::LINEAR);
+        self.art_cache.insert(key.clone(), handle);
+        self.art_cache.get(&key).cloned()
+    }
+
+    // -------------------------------------------------------------------------
+    // Global keyboard shortcuts
+    // -------------------------------------------------------------------------
+
+    pub fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        // Don't steal keys while a text field is focused.
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let (space, left, right, m_key, l_key, s_key) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::M),
+                i.key_pressed(egui::Key::L),
+                i.key_pressed(egui::Key::S),
+            )
+        });
+        if space { self.toggle_playback(); }
+        if left  { self.play_queue_offset(-1); }
+        if right { self.play_queue_offset(1); }
+        if m_key { self.toggle_mute(); }
+        if l_key { self.cycle_repeat(); }
+        if s_key { self.toggle_shuffle(); }
+    }
+
+    pub fn toggle_mute(&mut self) {
+        let Some(player) = self.audio_player.as_mut() else { return };
+        if player.volume() > 0.0 {
+            player.set_volume(0.0);
+        } else {
+            player.set_volume(0.7);
+        }
+    }
+
+    pub fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+    }
+
+    pub fn cycle_repeat(&mut self) {
+        self.repeat = self.repeat.next();
+    }
+
+    // -------------------------------------------------------------------------
+    // Context-menu track actions
+    // -------------------------------------------------------------------------
+
+    pub fn handle_track_action(&mut self, action: TrackAction, track_id: i64) {
+        match action {
+            TrackAction::PlayNow => {
+                self.selected_track_id = Some(track_id);
+                self.play_selected_from_visible();
+            }
+            TrackAction::AddToQueueEnd => {
+                self.queue.push(track_id);
+                if self.queue_position.is_none() && !self.queue.is_empty() {
+                    self.queue_position = Some(0);
+                    self.play_track(track_id);
+                } else {
+                    self.status = "Added to end of queue.".to_string();
+                }
+            }
+            TrackAction::GoToAlbum => {
+                if let Some(track) = self.tracks.iter().find(|t| t.id == track_id).cloned() {
+                    self.open_album(&track.artist, &track.album);
+                }
+            }
+            TrackAction::GoToArtist => {
+                if let Some(track) = self.tracks.iter().find(|t| t.id == track_id).cloned() {
+                    self.open_artist(&track.artist);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Playlist management
+    // -------------------------------------------------------------------------
+
+    pub fn refresh_playlists(&mut self) {
+        self.playlists = db::list_playlists(&self.db_path).unwrap_or_default();
+    }
+
+    pub fn playlist_views(&self) -> Vec<PlaylistView> {
+        self.playlists
+            .iter()
+            .map(|pl| {
+                let track_ids =
+                    db::list_playlist_track_ids(&self.db_path, pl.id).unwrap_or_default();
+                PlaylistView { playlist: pl.clone(), track_ids }
+            })
+            .collect()
+    }
+
+    pub fn active_playlist_view(&self) -> Option<PlaylistView> {
+        let id = self.active_playlist_id?;
+        let pl = self.playlists.iter().find(|p| p.id == id)?.clone();
+        let track_ids = db::list_playlist_track_ids(&self.db_path, id).unwrap_or_default();
+        Some(PlaylistView { playlist: pl, track_ids })
+    }
+
+    pub fn create_playlist(&mut self) {
+        let name = self.new_playlist_name.trim().to_string();
+        if name.is_empty() {
+            self.status = "Enter a playlist name first.".to_string();
+            return;
+        }
+        match db::create_playlist(&self.db_path, &name) {
+            Ok(id) => {
+                self.refresh_playlists();
+                self.active_playlist_id = Some(id);
+                self.library_view = LibraryView::Playlists;
+                self.new_playlist_name.clear();
+                self.show_create_playlist = false;
+                self.status = format!("Created playlist \"{name}\".");
+            }
+            Err(e) => self.status = format!("Failed to create playlist: {e}"),
+        }
+    }
+
+    pub fn delete_active_playlist(&mut self) {
+        let Some(id) = self.active_playlist_id else { return };
+        let name = self
+            .playlists
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        if db::delete_playlist(&self.db_path, id).is_ok() {
+            self.refresh_playlists();
+            self.active_playlist_id = self.playlists.first().map(|p| p.id);
+            self.status = format!("Deleted playlist \"{name}\".");
+        }
+    }
+
+    pub fn add_track_to_playlist(&mut self, playlist_id: i64, track_id: i64) {
+        match db::add_track_to_playlist(&self.db_path, playlist_id, track_id) {
+            Ok(()) => {
+                let pl_name = self
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == playlist_id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("playlist");
+                let track_title = self
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == track_id)
+                    .map(|t| t.title.as_str())
+                    .unwrap_or("track");
+                self.status = format!("Added \"{track_title}\" to \"{pl_name}\".");
+            }
+            Err(e) => self.status = format!("Could not add track: {e}"),
+        }
+        self.add_to_playlist_track_id = None;
+    }
+
+    pub fn remove_track_from_active_playlist(&mut self, track_id: i64) {
+        let Some(pl_id) = self.active_playlist_id else { return };
+        let _ = db::remove_track_from_playlist(&self.db_path, pl_id, track_id);
+    }
+
+    // -------------------------------------------------------------------------
+    // Playback control
+    // -------------------------------------------------------------------------
+
+    pub fn play_track(&mut self, track_id: i64) {
+        let track = self.tracks.iter().find(|t| t.id == track_id).cloned();
+        let Some(track) = track else {
+            self.status = "The selected track no longer exists in the library.".to_string();
+            return;
+        };
+        let Some(player) = self.audio_player.as_mut() else {
+            self.status = "Audio output is not available on this system.".to_string();
+            return;
+        };
+        match player.play_file(&track.file_path, track.duration_seconds) {
+            Ok(()) => {
+                self.now_playing_track_id = Some(track.id);
+                self.selected_track_id = Some(track.id);
+                let _ = db::record_track_play(&self.db_path, track.id);
+                self.refresh_home_personalization();
+                self.status = format!("Playing {} - {}", track.artist, track.title);
+            }
+            Err(e) => self.status = format!("Playback failed: {e}"),
+        }
+    }
+
+    pub fn play_track_list(&mut self, mut track_ids: Vec<i64>, start_index: usize) {
+        if track_ids.is_empty() {
+            self.status = "No tracks available to play in this selection.".to_string();
+            return;
+        }
+        let idx = if self.shuffle {
+            // Fisher-Yates: put the clicked track first, then shuffle the rest.
+            let clicked = track_ids.remove(start_index.min(track_ids.len() - 1));
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            // Deterministic-ish shuffle seeded by track id (no rand dep needed).
+            let seed = clicked as u64;
+            for i in (1..track_ids.len()).rev() {
+                let mut h = DefaultHasher::new();
+                (seed ^ i as u64).hash(&mut h);
+                let j = (h.finish() as usize) % (i + 1);
+                track_ids.swap(i, j);
+            }
+            track_ids.insert(0, clicked);
+            0
+        } else {
+            start_index.min(track_ids.len() - 1)
+        };
+        let id = track_ids[idx];
+        self.queue = track_ids;
+        self.queue_position = Some(idx);
+        self.play_track(id);
+    }
+
+    pub fn play_selected_from_visible(&mut self) {
         let Some(track_id) = self.selected_track_id else {
             self.status = "Select a track before playing.".to_string();
             return;
         };
 
-        let visible_track_ids: Vec<i64> = self.visible_tracks().into_iter().map(|track| track.id).collect();
-        if visible_track_ids.is_empty() {
+        use crate::models::{LibraryView, NavSection};
+        let visible: Vec<i64> = if self.active_nav == NavSection::Library
+            && self.library_view == LibraryView::Songs
+        {
+            self.sorted_library_tracks().into_iter().map(|t| t.id).collect()
+        } else if self.active_nav == NavSection::Search {
+            self.search_results().tracks.into_iter().map(|t| t.id).collect()
+        } else {
+            self.filtered_tracks().into_iter().map(|t| t.id).collect()
+        };
+
+        if visible.is_empty() {
             self.status = "No visible tracks are available to queue.".to_string();
             return;
         }
-
-        let queue_position = visible_track_ids.iter().position(|id| *id == track_id).unwrap_or(0);
-        self.queue = visible_track_ids;
-        self.queue_position = Some(queue_position);
+        let pos = visible.iter().position(|id| *id == track_id).unwrap_or(0);
+        self.queue = visible;
+        self.queue_position = Some(pos);
         self.play_track(track_id);
     }
 
-    fn play_track(&mut self, track_id: i64) {
-        let track = self.tracks.iter().find(|track| track.id == track_id).cloned();
-        let Some(track) = track else {
-            self.status = "The selected track no longer exists in the library.".to_string();
-            return;
-        };
-
-        let Some(player) = self.audio_player.as_mut() else {
-            self.status = "Audio output is not available on this system.".to_string();
-            return;
-        };
-
-        match player.play_file(&track.file_path) {
-            Ok(()) => {
-                self.now_playing_track_id = Some(track.id);
-                self.selected_track_id = Some(track.id);
-                self.status = format!("Playing {} - {}", track.artist, track.title);
-            }
-            Err(error) => {
-                self.status = format!("Playback failed: {error}");
-            }
-        }
-    }
-
-    fn play_queue_offset(&mut self, offset: isize) {
-        let Some(position) = self.queue_position else {
+    pub fn play_queue_offset(&mut self, offset: isize) {
+        let Some(pos) = self.queue_position else {
             self.status = "Start playback from the library to build a queue first.".to_string();
             return;
         };
+        let next = pos as isize + offset;
+        let queue_len = self.queue.len() as isize;
 
-        let next_position = position as isize + offset;
-        if next_position < 0 || next_position >= self.queue.len() as isize {
-            self.status = "Queue boundary reached.".to_string();
-            return;
-        }
+        let resolved = if next < 0 || next >= queue_len {
+            match self.repeat {
+                RepeatMode::Queue if !self.queue.is_empty() => {
+                    // Wrap around.
+                    ((next % queue_len + queue_len) % queue_len) as usize
+                }
+                RepeatMode::Track => pos, // stay on current
+                _ => {
+                    self.status = "Queue boundary reached.".to_string();
+                    return;
+                }
+            }
+        } else {
+            next as usize
+        };
 
-        let next_position = next_position as usize;
-        self.queue_position = Some(next_position);
-        let next_track_id = self.queue[next_position];
-        self.play_track(next_track_id);
+        self.queue_position = Some(resolved);
+        let id = self.queue[resolved];
+        self.play_track(id);
     }
 
-    fn toggle_playback(&mut self) {
+    pub fn toggle_playback(&mut self) {
         let Some(player) = self.audio_player.as_mut() else {
             self.status = "Audio output is not available on this system.".to_string();
             return;
         };
-
         match player.toggle_pause() {
             Some(true) => self.status = "Playback paused.".to_string(),
             Some(false) => self.status = "Playback resumed.".to_string(),
@@ -312,358 +826,29 @@ impl PlaymuApp {
         }
     }
 
-    fn queue_tracks(&self) -> Vec<&Track> {
-        self.queue
-            .iter()
-            .filter_map(|track_id| self.tracks.iter().find(|track| track.id == *track_id))
-            .collect()
+    // -------------------------------------------------------------------------
+    // Navigation helpers
+    // -------------------------------------------------------------------------
+
+    pub fn open_artist(&mut self, artist: &str) {
+        self.browse_focus = BrowseFocus::Artist(artist.to_string());
+        self.library_view = LibraryView::Songs;
+        self.active_nav = NavSection::Library;
+        self.status = format!("Browsing artist: {artist}");
     }
 
-    fn nav_button(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-        let fill = if selected { ACCENT_GREEN_SOFT } else { SURFACE };
-        let text = if selected { Color32::WHITE } else { TEXT_MUTED };
-        ui.add_sized(
-            [ui.available_width(), 40.0],
-            egui::Button::new(RichText::new(label).color(text).strong()).fill(fill),
-        )
-    }
-
-    fn draw_sidebar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("sidebar")
-            .resizable(false)
-            .min_width(250.0)
-            .show(ctx, |ui| {
-                ui.add_space(12.0);
-                ui.label(RichText::new("PLAYMU").size(28.0).strong().color(Color32::WHITE));
-                ui.label(RichText::new("Spotify-like local music for Arch Linux").color(TEXT_MUTED));
-                ui.add_space(16.0);
-
-                for nav in [NavSection::Home, NavSection::Search, NavSection::Library] {
-                    if Self::nav_button(ui, self.active_nav == nav, nav.label()).clicked() {
-                        self.active_nav = nav;
-                    }
-                    ui.add_space(6.0);
-                }
-
-                ui.add_space(18.0);
-                ui.label(RichText::new("Import Local Music").strong());
-                ui.label(RichText::new("Point Playmu at a folder on this machine.").color(TEXT_MUTED));
-                ui.add(
-                    TextEdit::singleline(&mut self.source_input)
-                        .hint_text("/home/you/Music")
-                        .desired_width(f32::INFINITY),
-                );
-
-                if ui
-                    .add_enabled(!self.is_scanning, egui::Button::new("Import Folder").fill(ACCENT_GREEN))
-                    .clicked()
-                {
-                    self.start_scan();
-                }
-
-                if self.is_scanning {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Scanning library...");
-                    });
-                }
-
-                ui.add_space(20.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.label(RichText::new("Database").strong());
-                ui.small(self.db_path.display().to_string());
-                ui.add_space(10.0);
-                ui.label(RichText::new("Status").strong());
-                ui.label(RichText::new(&self.status).color(TEXT_MUTED));
-            });
-    }
-
-    fn draw_right_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("queue_panel")
-            .default_width(300.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.add_space(12.0);
-                ui.label(RichText::new("Queue").size(22.0).strong());
-                ui.label(RichText::new("Local playback queue, no streaming required.").color(TEXT_MUTED));
-                ui.add_space(12.0);
-
-                let queue_tracks: Vec<Track> = self.queue_tracks().into_iter().cloned().collect();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (index, track) in queue_tracks.iter().enumerate() {
-                        let active = self.queue_position == Some(index);
-                        let button = egui::Button::new(
-                            RichText::new(format!("{}\n{}", track.title, track.artist)).color(Color32::WHITE),
-                        )
-                        .fill(if active { ACCENT_GREEN_SOFT } else { SURFACE });
-
-                        if ui.add_sized([ui.available_width(), 52.0], button).clicked() {
-                            self.queue_position = Some(index);
-                            self.play_track(track.id);
-                        }
-                        ui.add_space(4.0);
-                    }
-
-                    if self.queue.is_empty() {
-                        ui.add_space(16.0);
-                        ui.label(RichText::new("Queue is empty.").strong());
-                        ui.label(RichText::new("Play a track from the visible results to build the queue.").color(TEXT_MUTED));
-                    }
-                });
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.label(RichText::new("Selection").strong());
-                if let Some(track) = self.selected_track() {
-                    ui.label(RichText::new(&track.title).size(18.0).strong());
-                    ui.label(RichText::new(format!("{} - {}", track.artist, track.album)).color(TEXT_MUTED));
-                    ui.small(&track.file_path);
-                } else {
-                    ui.label(RichText::new("Nothing selected.").color(TEXT_MUTED));
-                }
-            });
-    }
-
-    fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(self.active_nav.label()).size(30.0).strong());
-                ui.label(RichText::new(self.active_nav.subtitle()).color(TEXT_MUTED));
-            });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_sized(
-                    [340.0, 36.0],
-                    TextEdit::singleline(&mut self.search_query)
-                        .hint_text("What do you want to play?")
-                        .desired_width(340.0),
-                );
-            });
-        });
-    }
-
-    fn draw_stat_card(ui: &mut egui::Ui, title: &str, value: String, subtitle: &str) {
-        egui::Frame::group(ui.style()).fill(SURFACE).show(ui, |ui| {
-            ui.set_min_size(egui::vec2(210.0, 118.0));
-            ui.label(RichText::new(title).color(TEXT_MUTED).strong());
-            ui.add_space(8.0);
-            ui.label(RichText::new(value).size(32.0).strong());
-            ui.add_space(8.0);
-            ui.label(RichText::new(subtitle).color(TEXT_MUTED));
-        });
-    }
-
-    fn draw_track_row(&mut self, ui: &mut egui::Ui, track: &Track, highlighted: bool) {
-        let duration_label = if track.duration_seconds > 0 {
-            format_duration(track.duration_seconds)
-        } else {
-            "--:--".to_string()
+    pub fn open_album(&mut self, artist: &str, album: &str) {
+        self.browse_focus = BrowseFocus::Album {
+            artist: artist.to_string(),
+            album: album.to_string(),
         };
-
-        let response = egui::Frame::group(ui.style())
-            .fill(if highlighted { ACCENT_GREEN_SOFT } else { SURFACE })
-            .show(ui, |ui| {
-                ui.set_min_height(56.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&track.title).color(Color32::WHITE).strong());
-                        ui.label(
-                            RichText::new(format!("{} - {}", track.artist, track.album)).color(TEXT_MUTED),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(duration_label).color(TEXT_MUTED));
-                    });
-                });
-            })
-            .response;
-        if response.clicked() {
-            self.selected_track_id = Some(track.id);
-        }
-        if response.double_clicked() {
-            self.selected_track_id = Some(track.id);
-            self.play_selected_from_visible();
-        }
-        ui.add_space(6.0);
+        self.library_view = LibraryView::Songs;
+        self.active_nav = NavSection::Library;
+        self.status = format!("Browsing album: {artist} - {album}");
     }
 
-    fn draw_home(&mut self, ui: &mut egui::Ui) {
-        let stats = self.library_stats();
-
-        egui::Frame::group(ui.style()).fill(PANEL_SOFT).show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new("Built for owned music, not streaming catalogs.").color(TEXT_MUTED));
-            ui.label(
-                RichText::new("Make the local library feel premium again.")
-                    .size(34.0)
-                    .strong(),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        self.selected_track_id.is_some(),
-                        egui::Button::new("Play Selection").fill(ACCENT_GREEN),
-                    )
-                    .clicked()
-                {
-                    self.play_selected_from_visible();
-                }
-                if ui.button("Go To Library").clicked() {
-                    self.active_nav = NavSection::Library;
-                }
-            });
-        });
-
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            Self::draw_stat_card(ui, "Tracks", stats.track_count.to_string(), "Indexed from local source folders");
-            Self::draw_stat_card(ui, "Artists", stats.artist_count.to_string(), "Normalized from imported folders");
-            Self::draw_stat_card(ui, "Albums", stats.album_count.to_string(), "Ready for album-centric browsing");
-        });
-
-        ui.add_space(18.0);
-        ui.columns(2, |columns| {
-            columns[0].label(RichText::new("Recently Added").size(22.0).strong());
-            columns[0].add_space(8.0);
-            egui::ScrollArea::vertical().max_height(360.0).show(&mut columns[0], |ui| {
-                for track in stats.recent_tracks {
-                    let highlighted = self.selected_track_id == Some(track.id);
-                    self.draw_track_row(ui, &track, highlighted);
-                }
-                if self.tracks.is_empty() {
-                    ui.label(RichText::new("Import a folder to populate Home.").color(TEXT_MUTED));
-                }
-            });
-
-            columns[1].label(RichText::new("Top Artists In Your Library").size(22.0).strong());
-            columns[1].add_space(8.0);
-            egui::ScrollArea::vertical().max_height(360.0).show(&mut columns[1], |ui| {
-                for (artist, count) in stats.top_artists {
-                    egui::Frame::group(ui.style()).fill(SURFACE).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(artist).size(18.0).strong());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{} tracks", count)).color(TEXT_MUTED));
-                            });
-                        });
-                    });
-                    ui.add_space(6.0);
-                }
-                if self.tracks.is_empty() {
-                    ui.label(RichText::new("Artist summaries appear after import.").color(TEXT_MUTED));
-                }
-            });
-        });
-    }
-
-    fn draw_search(&mut self, ui: &mut egui::Ui) {
-        let visible_tracks: Vec<Track> = self.visible_tracks().into_iter().cloned().collect();
-        ui.label(RichText::new(format!("{} results", visible_tracks.len())).color(TEXT_MUTED));
-        ui.add_space(8.0);
-
-        if self.search_query.trim().is_empty() {
-            egui::Frame::group(ui.style()).fill(PANEL_SOFT).show(ui, |ui| {
-                ui.set_min_height(220.0);
-                ui.vertical_centered(|ui| {
-                    ui.add_space(48.0);
-                    ui.label(RichText::new("Search your local collection").size(28.0).strong());
-                    ui.label(RichText::new("Try a title, artist, or album in the search field above.").color(TEXT_MUTED));
-                });
-            });
-            return;
-        }
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for track in visible_tracks {
-                let highlighted = self.selected_track_id == Some(track.id);
-                self.draw_track_row(ui, &track, highlighted);
-            }
-            if self.visible_tracks().is_empty() {
-                ui.label(RichText::new("No results matched that search.").color(TEXT_MUTED));
-            }
-        });
-    }
-
-    fn draw_library(&mut self, ui: &mut egui::Ui) {
-        let visible_tracks: Vec<Track> = self.visible_tracks().into_iter().cloned().collect();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Tracks").size(22.0).strong());
-            ui.label(RichText::new(format!("{} visible", visible_tracks.len())).color(TEXT_MUTED));
-        });
-        ui.add_space(10.0);
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for track in visible_tracks {
-                let highlighted = self.selected_track_id == Some(track.id)
-                    || self.now_playing_track_id == Some(track.id);
-                self.draw_track_row(ui, &track, highlighted);
-            }
-
-            if self.tracks.is_empty() {
-                egui::Frame::group(ui.style()).fill(PANEL_SOFT).show(ui, |ui| {
-                    ui.set_min_height(240.0);
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(48.0);
-                        ui.label(RichText::new("No music indexed yet").size(28.0).strong());
-                        ui.label(RichText::new("Import a local music folder from the left sidebar to get started.").color(TEXT_MUTED));
-                    });
-                });
-            }
-        });
-    }
-
-    fn draw_bottom_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("playback_bar")
-            .min_height(98.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Now Playing").color(TEXT_MUTED).strong());
-                        if let Some(track) = self.current_track() {
-                            ui.label(RichText::new(&track.title).size(24.0).strong());
-                            ui.label(RichText::new(format!("{} - {}", track.artist, track.album)).color(TEXT_MUTED));
-                        } else {
-                            ui.label(RichText::new("Nothing playing yet").size(24.0).strong());
-                            ui.label(RichText::new("Select a track and hit play.").color(TEXT_MUTED));
-                        }
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-
-                        if ui.button("Next").clicked() {
-                            self.play_queue_offset(1);
-                        }
-
-                        let transport_label = if self.audio_player.as_ref().is_some_and(AudioPlayer::is_paused) {
-                            "Resume"
-                        } else {
-                            "Play / Pause"
-                        };
-                        if ui
-                            .add_enabled(
-                                self.audio_player.is_some(),
-                                egui::Button::new(transport_label).fill(ACCENT_GREEN),
-                            )
-                            .clicked()
-                        {
-                            self.toggle_playback();
-                        }
-
-                        if ui.button("Previous").clicked() {
-                            self.play_queue_offset(-1);
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-            });
+    pub fn clear_browse_focus(&mut self) {
+        self.browse_focus = BrowseFocus::All;
     }
 }
 
@@ -671,12 +856,27 @@ impl eframe::App for PlaymuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_background_events();
 
+        // Auto-advance when the current track ends.
+        if self.audio_player.as_mut().is_some_and(AudioPlayer::take_finished) {
+            self.play_queue_offset(1);
+        }
+
+        // Live-repaint the progress bar while playing.
+        if self
+            .audio_player
+            .as_ref()
+            .is_some_and(|p| p.has_track() && !p.is_paused())
+        {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+
         self.draw_sidebar(ctx);
         self.draw_right_panel(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(12.0);
             self.draw_top_bar(ui);
+            self.handle_search_shortcuts(ctx);
             ui.add_space(16.0);
 
             match self.active_nav {
@@ -688,81 +888,4 @@ impl eframe::App for PlaymuApp {
 
         self.draw_bottom_bar(ctx);
     }
-}
-
-struct AudioPlayer {
-    _stream: OutputStream,
-    handle: OutputStreamHandle,
-    current_sink: Option<Sink>,
-}
-
-impl AudioPlayer {
-    fn new() -> anyhow::Result<Self> {
-        let (stream, handle) = OutputStream::try_default()?;
-        Ok(Self {
-            _stream: stream,
-            handle,
-            current_sink: None,
-        })
-    }
-
-    fn play_file(&mut self, file_path: &str) -> anyhow::Result<()> {
-        if let Some(sink) = self.current_sink.take() {
-            sink.stop();
-        }
-
-        let file = File::open(file_path)?;
-        let source = Decoder::new(BufReader::new(file))?;
-        let sink = Sink::try_new(&self.handle)?;
-        sink.append(source);
-        sink.play();
-        self.current_sink = Some(sink);
-
-        Ok(())
-    }
-
-    fn toggle_pause(&mut self) -> Option<bool> {
-        let sink = self.current_sink.as_ref()?;
-        if sink.is_paused() {
-            sink.play();
-            Some(false)
-        } else {
-            sink.pause();
-            Some(true)
-        }
-    }
-
-    fn is_paused(&self) -> bool {
-        match &self.current_sink {
-            Some(sink) => sink.is_paused(),
-            None => false,
-        }
-    }
-}
-
-fn configure_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.override_text_color = Some(Color32::from_rgb(242, 245, 246));
-    visuals.panel_fill = PANEL_DARK;
-    visuals.faint_bg_color = PANEL_SOFT;
-    visuals.extreme_bg_color = PANEL_SOFT;
-    visuals.window_fill = PANEL_DARK;
-    visuals.widgets.noninteractive.bg_fill = PANEL_SOFT;
-    visuals.widgets.inactive.bg_fill = SURFACE;
-    visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
-    visuals.widgets.active.bg_fill = ACCENT_GREEN_SOFT;
-    visuals.selection.bg_fill = ACCENT_GREEN;
-    ctx.set_visuals(visuals);
-
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(14.0, 12.0);
-    style.spacing.window_margin = egui::Margin::same(14);
-    ctx.set_style(style);
-}
-
-fn format_duration(duration_seconds: i64) -> String {
-    let minutes = duration_seconds / 60;
-    let seconds = duration_seconds % 60;
-    format!("{minutes}:{seconds:02}")
 }
