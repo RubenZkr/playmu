@@ -14,7 +14,8 @@ use crate::{
     library::{self, ScanSummary},
     models::{
         AlbumSummary, ArtistSummary, BrowseFocus, LibraryDensity, LibrarySortKey, LibraryStats,
-        LibraryView, MixSummary, NavSection, PlaylistView, RepeatMode, SearchResults,
+        LibraryView, LyricsData, MixSummary, NavSection, PlaylistView, RepeatMode, SearchResults,
+        SongViewTab,
     },
     theme::configure_theme,
     util::{summarize_albums, summarize_artists},
@@ -67,6 +68,14 @@ pub struct PlaymuApp {
     pub(crate) art_cache: HashMap<String, egui::TextureHandle>,
     // Current time for animations (seconds since startup)
     pub(crate) anim_time: f64,
+    // Song View overlay
+    pub(crate) song_view_open: bool,
+    pub(crate) song_view_tab: SongViewTab,
+    /// 0.0 = fully closed, 1.0 = fully open (drives the appear animation).
+    pub(crate) song_view_anim: f32,
+    pub(crate) waveform_data: Option<Vec<f32>>,
+    pub(crate) waveform_receiver: Option<Receiver<Vec<f32>>>,
+    pub(crate) lyrics_data: Option<LyricsData>,
 }
 
 impl PlaymuApp {
@@ -125,6 +134,12 @@ impl PlaymuApp {
             queue_panel_open: true,
             art_cache: HashMap::new(),
             anim_time: 0.0,
+            song_view_open: false,
+            song_view_tab: SongViewTab::Cover,
+            song_view_anim: 0.0,
+            waveform_data: None,
+            waveform_receiver: None,
+            lyrics_data: None,
         };
         app.refresh_home_personalization();
         app.refresh_playlists();
@@ -534,10 +549,84 @@ impl PlaymuApp {
             .pixels()
             .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
             .collect();
-        let color_image = egui::ColorImage { size: [w as usize, h as usize], pixels };
+        let color_image = egui::ColorImage::new([w as usize, h as usize], pixels);
         let handle = ctx.load_texture(&key, color_image, egui::TextureOptions::LINEAR);
         self.art_cache.insert(key.clone(), handle);
         self.art_cache.get(&key).cloned()
+    }
+
+    // -------------------------------------------------------------------------
+    // Song View
+    // -------------------------------------------------------------------------
+
+    pub fn open_song_view(&mut self) {
+        if self.now_playing_track_id.is_none() {
+            return;
+        }
+        self.song_view_open = true;
+        self.load_lyrics_for_current_track();
+    }
+
+    pub fn close_song_view(&mut self) {
+        self.song_view_open = false;
+    }
+
+    pub fn request_waveform(&mut self) {
+        if self.waveform_data.is_some() || self.waveform_receiver.is_some() {
+            return; // already loading or loaded
+        }
+        let Some(track) = self.current_track().cloned() else { return };
+        let path = track.file_path.clone();
+        let (tx, rx) = mpsc::channel();
+        self.waveform_receiver = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(compute_waveform(&path));
+        });
+    }
+
+    pub fn load_lyrics_for_current_track(&mut self) {
+        self.lyrics_data = None;
+        let Some(track) = self.current_track().cloned() else { return };
+
+        // 1. Look for a .lrc sidecar file next to the audio file.
+        let lrc_path = std::path::PathBuf::from(&track.file_path)
+            .with_extension("lrc");
+        if lrc_path.exists() {
+            if let Ok(lrc_text) = std::fs::read_to_string(&lrc_path) {
+                let parsed = parse_lrc(&lrc_text);
+                if !parsed.is_empty() {
+                    self.lyrics_data = Some(LyricsData::Synced(parsed));
+                    return;
+                }
+            }
+        }
+
+        // 2. Fall back to embedded tag lyrics via lofty.
+        use lofty::{file::TaggedFileExt, prelude::Accessor, probe::Probe, tag::ItemKey};
+        if let Ok(probe) = Probe::open(&track.file_path) {
+            if let Some(tagged) = probe.guess_file_type().ok().and_then(|p| p.read().ok()) {
+                if let Some(tag) = tagged.primary_tag() {
+                    let text = tag
+                        .get_string(ItemKey::UnsyncLyrics)
+                        .or_else(|| tag.get_string(ItemKey::Lyrics))
+                        .map(str::to_owned);
+                    if let Some(t) = text {
+                        if !t.trim().is_empty() {
+                            self.lyrics_data = Some(LyricsData::Plain(t));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn poll_waveform(&mut self) {
+        if let Some(rx) = &self.waveform_receiver {
+            if let Ok(data) = rx.try_recv() {
+                self.waveform_data = Some(data);
+                self.waveform_receiver = None;
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -721,6 +810,13 @@ impl PlaymuApp {
             Ok(()) => {
                 self.now_playing_track_id = Some(track.id);
                 self.selected_track_id = Some(track.id);
+                // Reset per-track song-view data.
+                self.waveform_data = None;
+                self.waveform_receiver = None;
+                self.lyrics_data = None;
+                if self.song_view_open {
+                    self.load_lyrics_for_current_track();
+                }
                 let _ = db::record_track_play(&self.db_path, track.id);
                 self.refresh_home_personalization();
                 self.status = format!("Playing {} - {}", track.artist, track.title);
@@ -856,6 +952,12 @@ impl eframe::App for PlaymuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.anim_time = ctx.input(|i| i.time);
         self.process_background_events();
+        self.poll_waveform();
+
+        // Close song view with Escape.
+        if self.song_view_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close_song_view();
+        }
 
         // Auto-advance when the current track ends.
         if self.audio_player.as_mut().is_some_and(AudioPlayer::take_finished) {
@@ -898,6 +1000,9 @@ impl eframe::App for PlaymuApp {
         });
 
         self.draw_bottom_bar(ctx);
+
+        // Song view overlay — drawn last so it sits on top of everything.
+        self.draw_song_view_overlay(ctx);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
@@ -908,3 +1013,98 @@ impl eframe::App for PlaymuApp {
 /// Internal helper: session persistence uses `image` for art decoding.
 #[allow(unused_imports)]
 use image as _image;
+
+// ---------------------------------------------------------------------------
+// Waveform & lyrics helpers (called from background threads)
+// ---------------------------------------------------------------------------
+
+/// Decode the audio file and return ~800 normalised RMS amplitude values.
+fn compute_waveform(path: &str) -> Vec<f32> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use rodio::{Decoder, Source};
+
+    const BARS: usize = 800;
+    const MAX_SAMPLES: usize = 10_000_000; // cap memory
+
+    let fallback = vec![0.0f32; BARS];
+
+    let Ok(file) = File::open(path) else { return fallback };
+    let Ok(decoder) = Decoder::new(BufReader::new(file)) else { return fallback };
+    let channels = decoder.channels() as usize;
+
+    // Collect mono-mixed samples, capped.
+    let samples: Vec<f32> = decoder
+        .take(MAX_SAMPLES)
+        .collect::<Vec<i16>>()
+        .chunks(channels)
+        .map(|frame| {
+            let sum: i32 = frame.iter().map(|&s| s as i32).sum();
+            (sum as f32 / (channels as f32 * 32768.0)).clamp(-1.0, 1.0)
+        })
+        .collect();
+
+    if samples.is_empty() {
+        return fallback;
+    }
+
+    let window = (samples.len() / BARS).max(1);
+    let mut result: Vec<f32> = samples
+        .chunks(window)
+        .take(BARS)
+        .map(|chunk| {
+            let rms = (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt();
+            rms
+        })
+        .collect();
+
+    // Normalize to [0, 1].
+    let peak = result.iter().cloned().fold(0.0f32, f32::max).max(0.001);
+    for v in &mut result {
+        *v /= peak;
+    }
+    // Pad if necessary.
+    while result.len() < BARS {
+        result.push(0.0);
+    }
+    result
+}
+
+/// Parse LRC-format lyrics into (timestamp_seconds, line) pairs.
+fn parse_lrc(text: &str) -> Vec<(f64, String)> {
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let raw = raw.trim();
+        if !raw.starts_with('[') {
+            continue;
+        }
+        // Multiple timestamps per line are supported: [mm:ss.xx][mm:ss.xx]text
+        let mut rest = raw;
+        let mut timestamps: Vec<f64> = Vec::new();
+        loop {
+            let Some(close) = rest.find(']') else { break };
+            let tag = &rest[1..close];
+            rest = &rest[close + 1..];
+            // Try to parse as mm:ss.xx
+            if let Some(ts) = parse_lrc_timestamp(tag) {
+                timestamps.push(ts);
+            } else {
+                break; // Not a timestamp tag — metadata tag, skip.
+            }
+        }
+        let lyric_line = rest.trim().to_string();
+        for ts in timestamps {
+            lines.push((ts, lyric_line.clone()));
+        }
+    }
+    lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    lines
+}
+
+fn parse_lrc_timestamp(s: &str) -> Option<f64> {
+    // "mm:ss.xx" or "mm:ss.xxx"
+    let colon = s.find(':')?;
+    let minutes: f64 = s[..colon].parse().ok()?;
+    let seconds: f64 = s[colon + 1..].parse().ok()?;
+    Some(minutes * 60.0 + seconds)
+}

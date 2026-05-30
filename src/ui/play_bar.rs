@@ -51,11 +51,20 @@ impl PlaymuApp {
                         |ui| {
                             if let Some(track) = &current {
                                 // Animated equalizer badge overlaid on art when playing.
+                                // Clickable → opens Song View.
                                 let art_rect = {
-                                    let (rect, _) = ui.allocate_exact_size(
+                                    let (rect, art_resp) = ui.allocate_exact_size(
                                         Vec2::splat(56.0),
-                                        egui::Sense::hover(),
+                                        egui::Sense::click(),
                                     );
+                                    if art_resp.clicked() {
+                                        self.open_song_view();
+                                    }
+                                    if art_resp.hovered() {
+                                        // Tooltip hint + pointer cursor.
+                                        art_resp.on_hover_text("Open Song View");
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
                                     rect
                                 };
                                 // Draw art (real or gradient).
@@ -103,10 +112,16 @@ impl PlaymuApp {
                                             anim_time,
                                         );
                                     }
+                                    // Green ring when song view is open.
+                                    let ring_color = if self.song_view_open {
+                                        ACCENT_GREEN
+                                    } else {
+                                        Color32::from_white_alpha(20)
+                                    };
                                     painter.rect_stroke(
                                         art_rect,
                                         corner,
-                                        Stroke::new(1.0, Color32::from_white_alpha(20)),
+                                        Stroke::new(if self.song_view_open { 2.0 } else { 1.0 }, ring_color),
                                         eframe::egui::StrokeKind::Inside,
                                     );
                                 }

@@ -17,10 +17,10 @@ impl PlaymuApp {
         } else {
             "--:--".to_string()
         };
-        let search_q = if self.active_nav == NavSection::Search {
-            self.search_query.trim()
+        let search_q: String = if self.active_nav == NavSection::Search {
+            self.search_query.trim().to_string()
         } else {
-            ""
+            String::new()
         };
         let is_now_playing = self.now_playing_track_id == Some(track.id);
         let fill = if highlighted { ACCENT_GREEN_SOFT } else { SURFACE };
@@ -44,10 +44,10 @@ impl PlaymuApp {
                     play_art_clicked = clicked;
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
-                        ui.label(highlight_match_job(&track.title, search_q, title_color, true));
+                        ui.label(highlight_match_job(&track.title, &search_q, title_color, true));
                         ui.label(highlight_match_job(
                             &format!("{} - {}", track.artist, track.album),
-                            search_q,
+                            &search_q,
                             TEXT_MUTED,
                             false,
                         ));
@@ -74,20 +74,20 @@ impl PlaymuApp {
         response.context_menu(|ui| {
             if ui.button("Play Now").clicked() {
                 ctx_action = Some(TrackAction::PlayNow);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Add to Queue End").clicked() {
                 ctx_action = Some(TrackAction::AddToQueueEnd);
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             if ui.button("Go to Album").clicked() {
                 ctx_action = Some(TrackAction::GoToAlbum);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Go to Artist").clicked() {
                 ctx_action = Some(TrackAction::GoToArtist);
-                ui.close_menu();
+                ui.close();
             }
         });
 

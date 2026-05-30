@@ -4,6 +4,7 @@ pub mod play_bar;
 pub mod queue_panel;
 pub mod search;
 pub mod sidebar;
+pub mod song_view;
 pub mod top_bar;
 pub mod track_row;
 pub mod widgets;
@@ -158,5 +159,6 @@ pub fn paint_art_play(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
-    (response, response.clicked())
+    let clicked = response.clicked();
+    (response, clicked)
 }

@@ -61,6 +61,24 @@ impl LibraryView {
     }
 }
 
+/// Which tab is active in the Song View overlay.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SongViewTab {
+    #[default]
+    Cover,
+    Lyrics,
+    Waves,
+}
+
+/// Lyrics content, either plain text or LRC-synced lines.
+#[derive(Clone)]
+pub enum LyricsData {
+    /// Unsynchronized plain text (from embedded tags).
+    Plain(String),
+    /// LRC-synchronized: (timestamp_seconds, line_text).
+    Synced(Vec<(f64, String)>),
+}
+
 /// Full playlist including its resolved track list.
 #[derive(Clone)]
 pub struct PlaylistView {

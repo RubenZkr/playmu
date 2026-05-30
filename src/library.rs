@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use lofty::{
-    file::TaggedFileExt,
+    file::{AudioFile, TaggedFileExt},
     picture::PictureType,
     prelude::Accessor,
     probe::Probe,

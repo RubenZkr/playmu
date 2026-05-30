@@ -594,20 +594,20 @@ impl PlaymuApp {
         response.context_menu(|ui| {
             if ui.button("Play Now").clicked() {
                 ctx_action = Some(TrackAction::PlayNow);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Add to Queue End").clicked() {
                 ctx_action = Some(TrackAction::AddToQueueEnd);
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             if ui.button("Go to Album").clicked() {
                 ctx_action = Some(TrackAction::GoToAlbum);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Go to Artist").clicked() {
                 ctx_action = Some(TrackAction::GoToArtist);
-                ui.close_menu();
+                ui.close();
             }
         });
 
